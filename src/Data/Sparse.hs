@@ -6,6 +6,7 @@ module Data.Sparse where
 import qualified Data.Vector         as V
 import qualified Data.Vector.Unboxed as U
 import           Prelude             hiding ((!!))
+import qualified Data.List as L
 
 type Index = (Int, Int)
 
@@ -32,6 +33,7 @@ data CSparseRow val = CSparseRow     { values     :: !(U.Vector val)
 
 instance (Show val, U.Unbox val, Num val) => Show (CSparseRow val) where
         show = showMatrix
+
 --Slow
 showMatrix :: (Show val, U.Unbox val, Num val) => CSparseRow val -> String
 showMatrix m = concatMap (\x -> showVec (m !! x) ++ "\n") [0..fst (dim m) - 1]
@@ -74,6 +76,14 @@ imap f m = m {values =  U.map (uncurry f) (U.zip index (values m)) }
               index = U.zip rows (colIndexes m)
               rows = U.convert $ V.foldl1' (V.++) $ V.zipWith (\a b -> V.replicate (b - a) a) ri (V.drop 1 ri)
               ri = V.convert $ U.snoc (rowIndexes m) (fst $ size m)
+
+elementwiseCSparseRow :: (U.Unbox val, Num val) => (val -> val -> val) -> CSparseRow val -> CSparseRow val -> CSparseRow val
+elementwiseCSparseRow f m1 m2 = 
+        where union row = toList (partcolIndexes row m1) `L.union` $ toList (partcolIndexes row m2)
+              --partValues row = U.slice (slice row) (slice (row + 1) - slice row) (values m)
+              partcolIndexes row = U.slice (slice row) (slice (row + 1) - slice row) $ colIndexes
+              slice row = U.snoc (rowIndexes m) r U.! row
+              r = fst $ size m
 
 csparseUpdateDiagonal :: (Num val) => CSparseRow val -> (Int -> val) -> CSparseRow val
 csparseUpdateDiagonal m f = m
