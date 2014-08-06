@@ -3,97 +3,127 @@
 
 module Data.Sparse where
 
-import qualified Data.Vector         as V
+import qualified Data.List           as L
+import           Debug.Trace
+--import qualified Data.Vector.Generic as V
 import qualified Data.Vector.Unboxed as U
-import           Prelude             hiding ((!!))
-import qualified Data.List as L
+import           Prelude             hiding (pred, (!!))
 
 type Index = (Int, Int)
+type Size = Index
 
-{-class (Num val) => Vector v val where-}
-        {-(!) :: v val -> Int -> val-}
-
-class (Num val) => Matrix m val where
+class (Num val, Pattern p) => MatrixClass m p val where
         -- multiply a matrix by a vector
-        (**) :: m val -> U.Vector val -> U.Vector val
-        generate :: (U.Unbox val, Num val) => Index -> (Index -> Bool) -> (Index -> val) -> m val
-        -- update the diagonal
-        updateDiagonal :: m val -> (Int -> val) -> m val
+        (*:) :: m p val -> U.Vector val -> U.Vector val
+        generateMatrix :: (Num val, Pattern p) => p -> (Index -> val) -> m p val
         -- get a row:
-        (!!) :: m val -> Int -> U.Vector val
-        dim :: m val -> Index
+        (!!) :: m p val -> Int -> U.Vector val
+        {-(+) :: m p val -> m p val -> m p val-}
+        {-(-) :: m p val -> m p val -> m p val-}
 
-data CSparseRow val = CSparseRow     { values     :: !(U.Vector val)
-                                     , colIndexes :: !(U.Vector Int)
-                                     --the start index in values and
-                                     --colIndices of each row.  should be
-                                     --terminated with "rows"
-                                     , rowIndexes :: !(U.Vector Int)
-                                     , size       :: !Index}
+class Pattern p where
+        union :: p -> p -> p
+        eye :: Size -> p
+        index :: p -> Int -> Index
+        size :: p -> Size
+        generatePattern :: Size -> (Index -> Bool) -> p
+        nnz :: p -> Int
 
-instance (Show val, U.Unbox val, Num val) => Show (CSparseRow val) where
-        show = showMatrix
+data CompressedSparseRow = CompressedSparseRow { _colIndexes   :: !(U.Vector Int)
+                                                 --the start index in values and
+                                                 --colIndices of each row.
+                                                 , _rowIndexes :: !(U.Vector Int)
+                                                 --if length rowIndexes
+                                                 -- is < (fst size), then
+                                                 -- there are empty rows.
+                                                 , _sizeCSR    :: !Size} deriving Show
 
---Slow
-showMatrix :: (Show val, U.Unbox val, Num val) => CSparseRow val -> String
-showMatrix m = concatMap (\x -> showVec (m !! x) ++ "\n") [0..fst (dim m) - 1]
-        where showVec v = U.foldl' (\a b -> a ++ ", " ++ show b) ("[" ++ show (U.head v)) (U.tail v) ++ "]"
+data RowMajorDense = RowMajorDense { _sizeRMD :: !Index } deriving Show
 
-diagonalMatrix :: (Matrix m val, U.Unbox val, Num val) => Index -> (Int -> val) -> m val
-diagonalMatrix s f = generate s (uncurry (==)) (\(x,_) -> f x)
+instance Pattern RowMajorDense where
+        eye s = RowMajorDense { _sizeRMD = s }
+        index p = \i -> (i `div` snd (size p), i `mod` snd (size p))
+        union p1 p2 | size p1 == size p2 = RowMajorDense { _sizeRMD = size p1 }
+                    | otherwise = undefined
+        size = _sizeRMD
+        generatePattern s _ = RowMajorDense { _sizeRMD = s }
+        nnz p = (fst $ size p) * (snd $ size p)
 
-generateCSparseRow :: (U.Unbox val, Num val) => Index -> (Index -> Bool) -> (Index -> val) -> CSparseRow val
-generateCSparseRow s p func = CSparseRow { values = U.fromList $ foldl1 (++) (map vals [0..(fst s)]),
-                                       colIndexes = U.fromList $ foldl1 (++) (map cols [0..(fst s)]),
-                                       rowIndexes = U.fromList rowindex,
-                                       size = s}
-        where cols row = [col | col <- [0..(snd s)], (\i -> p (row,i)) col]
-              vals row = [(\i -> func (row,i)) col | col <- cols row]
-              rowindex = scanl (\row l -> l + length (cols row)) 0 [0..(fst s)]
+instance Pattern CompressedSparseRow where
+        eye s = CompressedSparseRow { _colIndexes = U.generate (min (fst s) (snd s)) (\i -> i)
+                                    , _rowIndexes = U.generate (min (fst s) (snd s)) (\i -> i)
+                                    , _sizeCSR = s }
 
-rowOfCSparseRow :: (U.Unbox val, Num val) => CSparseRow val -> Int -> U.Vector val
-rowOfCSparseRow m row = let vec = U.replicate c 0 in
-                             U.update_ vec partcolIndexes partValues
-        where
-              partValues = U.slice (slice row) (slice (row + 1) - slice row) (values m)
-              partcolIndexes = U.slice (slice row) (slice (row + 1) - slice row) (colIndexes m)
-              slice = (U.!) (U.snoc (rowIndexes m) r)
-              c = snd $ size m
-              r = fst $ size m
+        index p = \i -> let c = _colIndexes p U.! i
+                            rs = _rowIndexes p
+                       in  (U.ifoldl' ( \le i' e -> if e <= i then i' else le) (fst $ size p) rs, c)
 
-mulCSparseRow :: (U.Unbox val, Num val) => CSparseRow val -> U.Vector val -> U.Vector val
-mulCSparseRow m v = U.generate r rowCalc
-        where rowCalc row = U.sum $ U.ifilter (\ i _ -> i `U.elem` partcolIndexes row) $ U.accumulate_ (*) v (partcolIndexes row) (partValues row)
-              partValues row = U.slice (slice row) (slice (row + 1) - slice row) (values m)
-              partcolIndexes row = U.slice (slice row) (slice (row + 1) - slice row) (colIndexes m)
-              slice row = U.snoc (rowIndexes m) r U.! row
-              r = fst $ size m
+        union p1 p2 | size p1 /= size p2 = undefined
+                    | size p1 == size p2 = CompressedSparseRow { _colIndexes = U.concat colslist
+                                          , _rowIndexes =  U.scanl' (+) 0 $ U.fromList $ map U.length colslist
+                                          , _sizeCSR = size p1}
+                      where
+                            colslist = map (\ row -> mergeUnion (partcolIndexes row p1) (partcolIndexes row p2)) [0..(r p1)]
+                            partcolIndexes row p = U.slice (slice p row) (slice p (row + 1) - slice p row) (_colIndexes p)
+                            slice p = (U.!) (U.snoc (_rowIndexes p) $ r p)
+                            r p = fst $ size p
 
---This might want to be in a function...
-imap :: (U.Unbox a, U.Unbox b) => (Index -> a -> b) -> CSparseRow a -> CSparseRow b
-imap f m = m {values =  U.map (uncurry f) (U.zip index (values m)) }
-        where index :: U.Vector Index
-              index = U.zip rows (colIndexes m)
-              rows = U.convert $ V.foldl1' (V.++) $ V.zipWith (\a b -> V.replicate (b - a) a) ri (V.drop 1 ri)
-              ri = V.convert $ U.snoc (rowIndexes m) (fst $ size m)
+        size = _sizeCSR
 
-elementwiseCSparseRow :: (U.Unbox val, Num val) => (val -> val -> val) -> CSparseRow val -> CSparseRow val -> CSparseRow val
-elementwiseCSparseRow f m1 m2 = 
-        where union row = toList (partcolIndexes row m1) `L.union` $ toList (partcolIndexes row m2)
-              --partValues row = U.slice (slice row) (slice (row + 1) - slice row) (values m)
-              partcolIndexes row = U.slice (slice row) (slice (row + 1) - slice row) $ colIndexes
-              slice row = U.snoc (rowIndexes m) r U.! row
-              r = fst $ size m
+        generatePattern s pred = CompressedSparseRow { _colIndexes = L.foldl1' (U.++) filteredvalues
+                                              , _rowIndexes = U.prescanl (+) 0 $  U.fromList $ map U.length $ filteredvalues
+                                              , _sizeCSR = s}
+                        where filteredvalues = map (\i -> snd $ U.unzip (U.filter pred i)) $ allvalues
+                              allvalues = map (\r -> U.zip (U.replicate cols r) (U.enumFromN 0 cols)) $ [0..rows-1]
+                              rows = fst s
+                              cols = snd s
 
-csparseUpdateDiagonal :: (Num val) => CSparseRow val -> (Int -> val) -> CSparseRow val
-csparseUpdateDiagonal m f = m
+        nnz = U.length . _colIndexes
 
-instance (U.Unbox val, Num val) => Matrix CSparseRow val where
-        (**) = mulCSparseRow
-        (!!) = rowOfCSparseRow
-        generate = generateCSparseRow
-        updateDiagonal = csparseUpdateDiagonal
-        dim = size
+traced :: (Show a) => a -> a
+traced a = traceShow a a
 
+mergeUnion :: (U.Unbox val, Ord val) => U.Vector val -> U.Vector val -> U.Vector val
+mergeUnion a b | U.null a = b
+               | U.null b = a
+               | (U.head a) == (U.head b) = (U.head a) `U.cons` mergeUnion (U.tail a) (U.tail b)
+               | (U.head a) < (U.head b) = (U.head a) `U.cons` mergeUnion (U.tail a) b
+               | (U.head a) > (U.head b) = (U.head b) `U.cons` mergeUnion a (U.tail b)
+               | otherwise = undefined
 
---
+data Matrix p val = Matrix { _values :: !(U.Vector val), _pattern :: p }
+
+instance (Show val, U.Unbox val, Num val) => MatrixClass Matrix CompressedSparseRow val where
+        (*:) m v = U.generate r rowCalc
+            where rowCalc row = U.sum $ U.ifilter (\ i _ -> i `U.elem` partcolIndexes row) $ U.accumulate_ (*) v (partcolIndexes row) (partValues row)
+                  partValues row = U.slice (slice row) (slice (row + 1) - slice row) (_values m)
+                  partcolIndexes row = U.slice (slice row) (slice (row + 1) - slice row) (_colIndexes pat)
+                  slice row = U.snoc (_rowIndexes pat) (nnz pat) U.! row
+                  r = fst $ size pat
+                  pat = _pattern m
+        generateMatrix p f = Matrix { _values = U.generate (nnz p) $ f . (index p), _pattern = p }
+
+        (!!) m row = let vec = U.replicate c 0 in
+                                 U.update_ vec partcolIndexes partValues
+                where
+                      partValues = U.slice (slice row) (slice (row + 1) - slice row) (_values m)
+                      partcolIndexes = U.slice (slice row) (slice (row + 1) - slice row) (_colIndexes p)
+                      slice = (U.!) (U.snoc (_rowIndexes p) $ nnz p)
+                      c = snd $ size p
+                      p = _pattern m
+        {-(+) m1 m2 = Matrix { _values = -}
+                           {-, _pattern = newpattern}-}
+                           {-where v1 = generateMatrix newpattern (\(r,c) -> )-}
+                                 {-newpattern = union (_pattern m1) (_pattern m2)-}
+
+instance (Show val, U.Unbox val, Num val) => Show (Matrix CompressedSparseRow val) where
+        show m = concatMap (\x -> showVec (m !! x) ++ "\n") [0..fst (size $ _pattern m) - 1]
+            where showVec v = U.foldl' (\a b -> a ++ ", " ++ show b) ("[" ++ show (U.head v)) (U.tail v) ++ "]"
+
+{---This might want to be in a function...-}
+{-imap :: (U.Unbox a, U.Unbox b) => (Index -> a -> b) -> CSparseRow a -> CSparseRow b-}
+{-imap f m = m {values =  U.map (uncurry f) (U.zip index (values m)) }-}
+        {-where index :: U.Vector Index-}
+              {-index = U.zip rows (colIndexes m)-}
+              {-rows = U.convert $ V.foldl1' (V.++) $ V.zipWith (\a b -> V.replicate (b - a) a) ri (V.drop 1 ri)-}
+              {-ri = V.convert $ U.snoc (rowIndexes m) (fst $ size m)-}
